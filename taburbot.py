@@ -7,13 +7,11 @@ from datetime import datetime
 import redis
 
 # --- Redis Veritabanı Bağlantısı ---
-# Railway, Redis eklendiğinde 'REDIS_URL' değişkenini otomatik tanımlar.
 REDIS_URL = os.environ.get("REDIS_URL")
 
 if REDIS_URL:
     r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 else:
-    # Yerel test ortamı için varsayılan Redis bağlantısı
     r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
 
 def veri_yukle():
@@ -31,6 +29,7 @@ def veri_kaydet(data):
 LOG_CHANNEL_ID = 1538484766129655818
 YETKILI_PUAN = 1529948882837049486     # Puan Ekle/Sil ve Tutanak için rol
 YETKILI_SIFIRLA = 1398636525910102076  # Toplu Sıfırlama yapabilecek rol
+GUILD_ID = 1398636278001434634        # AAT | Tabur Komutanlığı sunucu ID'si
 
 RANKS = {
     1415343719300993045: 'OF-6 Tuğgeneral',
@@ -44,19 +43,12 @@ RANKS = {
 }
 
 # --- /sayım-yap için Rütbe Eşikleri ---
-# tenzil          -> bu puanın ALTI "Tenzil"
-# terfi_yok_ust    -> bu puana kadar "Terfi yok, Tenzil yok", üzerinde "1x Terfi" başlar
-# bir_x_terfi_ust  -> bu puana kadar "1x Terfi", bu puan ve üstü "2x Terfi"
-# two_tier=True olan roller sadece "Tenzil" / "Terfi yok, Tenzil yok" arasında gider.
 RANK_CONFIG = [
     {"role_id": 1415343719300993045, "name": "OF6", "tenzil": 5, "terfi_yok_ust": 9, "bir_x_terfi_ust": 18},
     {"role_id": 1415343720479461487, "name": "OF7", "tenzil": 5.5, "terfi_yok_ust": 10, "bir_x_terfi_ust": 20},
     {"role_id": 1415343721402208346, "name": "OF8", "tenzil": 6, "terfi_yok_ust": 11, "bir_x_terfi_ust": 22},
-    # NOT: OF9 için Tenzil eşiği ayrıca belirtilmemişti, diğer rütbelerle tutarlı olacak
-    # şekilde 7 olarak varsayıldı.
     {"role_id": 1415343721423175770, "name": "OF9", "tenzil": 7, "terfi_yok_ust": 12, "bir_x_terfi_ust": 24},
     {"role_id": 1529208424016117830, "name": "Büyük Konsey", "tenzil": 8, "terfi_yok_ust": 12, "bir_x_terfi_ust": 24},
-    # NOT: "13>= 1x terfi" yazım hatası kabul edilip üst sınırla (14) tutarlı hale getirildi.
     {"role_id": 1529208202477047959, "name": "Ankara Heyeti", "tenzil": 8, "terfi_yok_ust": 14, "bir_x_terfi_ust": 26},
     {"role_id": 1529208215420539004, "name": "Ordu Komutanı", "tenzil": 8, "terfi_yok_ust": 14, "bir_x_terfi_ust": 28},
     {"role_id": 1529208057081364590, "name": "Askeri Kurultay", "tenzil": 12, "two_tier": True},
@@ -109,24 +101,19 @@ def check_puan_yetki(interaction: discord.Interaction):
     return YETKILI_PUAN in role_ids
 
 def check_sifirla_yetki(interaction: discord.Interaction):
-    # Kullanıcı isteği üzerine: SADECE YETKILI_SIFIRLA rolüne sahip olanlar kullanabilir.
-    # (Administrator baypası kaldırıldı.)
     role_ids = [role.id for role in interaction.user.roles]
     return YETKILI_SIFIRLA in role_ids
 
-GUILD_ID = 1398636278001434634  # AAT | Tabur Komutanlığı sunucu ID'si
-
 @bot.event
 async def on_ready():
+    print(f'{bot.user} olarak giriş yapıldı! Bot ve Redis veritabanı aktif.')
     try:
-        # Test sunucusuna özel sync -> komutlar anında görünür (global sync 1 saate kadar sürebilir)
         guild = discord.Object(id=GUILD_ID)
-        bot.tree.copy_global_to(guild=guild)
+        # Komutların doğrudan test sunucusuna anında senkronize edilmesi
         synced = await bot.tree.sync(guild=guild)
         print(f"Slash komutları senkronize edildi: {len(synced)} komut.")
     except Exception as e:
-        print(e)
-    print(f'{bot.user} olarak giriş yapıldı! Bot ve Redis veritabanı aktif.')
+        print(f"Senkronizasyon hatası: {e}")
 
 # ================================
 # /PUAN GRUBU
@@ -388,11 +375,10 @@ class SayimView(discord.ui.View):
             except discord.HTTPException:
                 pass
 
-
-@bot.tree.command(name="sayım-yap", description="Rütbe rollerine göre sayım yapar ve terfi/tenzil durumunu gösterir")
+# Guild parametresi eklenerek komutun doğrudan test sunucusuna kaydedilmesi garantiye alındı
+@bot.tree.command(name="sayım-yap", description="Rütbe rollerine göre sayım yapar ve terfi/tenzil durumunu gösterir", guild=discord.Object(id=GUILD_ID))
 async def sayim_yap(interaction: discord.Interaction):
     await interaction.response.defer()
-    # Rol üyeliklerinin tam ve güncel olması için üyeleri chunk'la.
     if interaction.guild.chunked is False:
         await interaction.guild.chunk()
 
@@ -403,11 +389,11 @@ async def sayim_yap(interaction: discord.Interaction):
 
 
 # --- Komut Gruplarını Ağaca (Tree) Ekleme ---
-bot.tree.add_command(puan_group)
-bot.tree.add_command(tutanak_group)
+bot.tree.add_command(puan_group, guild=discord.Object(id=GUILD_ID))
+bot.tree.add_command(tutanak_group, guild=discord.Object(id=GUILD_ID))
 
 toplu_group.add_command(toplu_puan_group)
-bot.tree.add_command(toplu_group)
+bot.tree.add_command(toplu_group, guild=discord.Object(id=GUILD_ID))
 
 # --- Bot Çalıştırma ---
 TOKEN = os.environ.get("DISCORD_TOKEN")
