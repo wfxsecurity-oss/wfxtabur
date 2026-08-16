@@ -1,0 +1,288 @@
+import discord
+from discord.ext import commands
+import json
+import os
+import time
+from datetime import datetime
+import redis
+
+# --- Redis Veritabanı Bağlantısı ---
+# Railway, Redis eklendiğinde 'REDIS_URL' değişkenini otomatik tanımlar.
+REDIS_URL = os.environ.get("REDIS_URL")
+
+if REDIS_URL:
+    r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+else:
+    # Yerel test ortamı için varsayılan Redis bağlantısı
+    r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+
+def veri_yukle():
+    data = r.get("bot_verileri")
+    if not data:
+        varsayilan = {"users": {}, "records": {}}
+        veri_kaydet(varsayilan)
+        return varsayilan
+    return json.loads(data)
+
+def veri_kaydet(data):
+    r.set("bot_verileri", json.dumps(data, ensure_ascii=False))
+
+# --- Gerekli Tanımlamalar ---
+LOG_CHANNEL_ID = 1538484766129655818
+YETKILI_PUAN = 1529948882837049486     # Puan Ekle/Sil ve Tutanak için rol
+YETKILI_SIFIRLA = 1398636525910102076  # Toplu Sıfırlama yapabilecek rol
+
+RANKS = {
+    1415343719300993045: 'OF-6 Tuğgeneral',
+    1415343720479461487: 'OF-7 Tümgeneral',
+    1415343721402208346: 'OF-8 Korgeneral',
+    1415343721423175770: 'OF-9 Orgeneral',
+    1529208424016117830: 'Büyük Konsey',
+    1529208202477047959: 'Ankara Heyeti',
+    1529208215420539004: 'Ordu Komutanı',
+    1529208057081364590: 'Askeri Kurultay'
+}
+
+# --- Bot Kurulumu (Intents) ---
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# --- Log Gönderme Fonksiyonu ---
+async def send_log(title, actor, target_id, reason, color):
+    channel = bot.get_channel(LOG_CHANNEL_ID)
+    if not channel:
+        return
+    
+    embed = discord.Embed(title=title, color=color)
+    embed.add_field(name="Tarih", value=f"<t:{int(time.time())}:F>", inline=False)
+    
+    actor_text = actor.mention if actor else "Bilinmiyor"
+    target_text = f"<@{target_id}>" if target_id else "Toplu İşlem"
+    
+    embed.add_field(name="İşlemi Yapan", value=actor_text, inline=True)
+    embed.add_field(name="İşlem Uygulanan", value=target_text, inline=True)
+    embed.add_field(name="Sebep", value=reason, inline=False)
+    
+    await channel.send(embed=embed)
+
+# --- Yetki Kontrolü ---
+def check_puan_yetki(interaction: discord.Interaction):
+    if interaction.user.guild_permissions.administrator: 
+        return True
+    role_ids = [role.id for role in interaction.user.roles]
+    return YETKILI_PUAN in role_ids
+
+def check_sifirla_yetki(interaction: discord.Interaction):
+    if interaction.user.guild_permissions.administrator: 
+        return True
+    role_ids = [role.id for role in interaction.user.roles]
+    return YETKILI_SIFIRLA in role_ids
+
+@bot.event
+async def on_ready():
+    try:
+        synced = await bot.tree.sync()
+        print(f"Slash komutları senkronize edildi: {len(synced)} komut.")
+    except Exception as e:
+        print(e)
+    print(f'{bot.user} olarak giriş yapıldı! Bot ve Redis veritabanı aktif.')
+
+# ================================
+# /PUAN GRUBU
+# ================================
+puan_group = discord.app_commands.Group(name="puan", description="Puan işlemleri")
+
+@puan_group.command(name="ekle", description="Personele puan ekler")
+@discord.app_commands.describe(member="Puan eklenecek personel", miktar="Eklenecek puan miktarı", sebep="İşlem sebebi")
+async def puan_ekle(interaction: discord.Interaction, member: discord.Member, miktar: int, sebep: str = "Belirtilmedi"):
+    if not check_puan_yetki(interaction):
+        return await interaction.response.send_message("Bu komutu kullanmak için gerekli role sahip değilsin.", ephemeral=True)
+    if miktar <= 0:
+        return await interaction.response.send_message("Lütfen 0'dan büyük bir puan girin.", ephemeral=True)
+
+    data = veri_yukle()
+    user_id_str = str(member.id)
+    
+    if user_id_str not in data["users"]:
+        data["users"][user_id_str] = 0
+    
+    data["users"][user_id_str] += miktar
+    veri_kaydet(data)
+
+    await interaction.response.send_message(f"{member.mention} kişisine başarıyla **{miktar}** puan eklendi.")
+    await send_log("🟢 Puan Eklendi", interaction.user, member.id, sebep, discord.Color.green())
+
+@puan_group.command(name="sil", description="Personele puan siler")
+@discord.app_commands.describe(member="Puanı silinecek personel", miktar="Silinecek puan miktarı", sebep="İşlem sebebi")
+async def puan_sil(interaction: discord.Interaction, member: discord.Member, miktar: int, sebep: str = "Belirtilmedi"):
+    if not check_puan_yetki(interaction):
+        return await interaction.response.send_message("Bu komutu kullanmak için gerekli role sahip değilsin.", ephemeral=True)
+    if miktar <= 0:
+        return await interaction.response.send_message("Lütfen 0'dan büyük bir puan girin.", ephemeral=True)
+
+    data = veri_yukle()
+    user_id_str = str(member.id)
+    
+    if user_id_str not in data["users"] or data["users"][user_id_str] <= 0:
+        return await interaction.response.send_message("Bu kullanıcının sistemde puanı bulunmuyor.", ephemeral=True)
+
+    if data["users"][user_id_str] >= miktar:
+        data["users"][user_id_str] -= miktar
+    else:
+        data["users"][user_id_str] = 0
+    
+    veri_kaydet(data)
+
+    await interaction.response.send_message(f"{member.mention} kişisinden başarıyla **{miktar}** puan silindi.")
+    await send_log("🔴 Puan Silindi", interaction.user, member.id, sebep, discord.Color.red())
+
+@puan_group.command(name="sorgu", description="Personelin puanını sorgular")
+@discord.app_commands.describe(member="Puanı sorgulanacak personel (Boş bırakırsanız kendiniz olursunuz)")
+async def puan_sorgu(interaction: discord.Interaction, member: discord.Member = None):
+    target = member or interaction.user
+    data = veri_yukle()
+    points = data["users"].get(str(target.id), 0)
+    
+    await interaction.response.send_message(f"{target.mention} adlı kullanıcının güncel puanı: **{points}**")
+
+
+# ================================
+# /TUTANAK GRUBU
+# ================================
+tutanak_group = discord.app_commands.Group(name="tutanak", description="Tutanak işlemleri")
+
+@tutanak_group.command(name="ekle", description="Personele tutanak ekler")
+@discord.app_commands.describe(member="Tutanağın tutulacağı personel", sebep="Tutanak sebebi")
+async def tutanak_ekle(interaction: discord.Interaction, member: discord.Member, sebep: str):
+    if not check_puan_yetki(interaction):
+        return await interaction.response.send_message("Tutanak eklemek için yetkiniz yok.", ephemeral=True)
+
+    data = veri_yukle()
+    record_id = str(len(data["records"]) + 1)
+    tarih = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+    data["records"][record_id] = {
+        "user_id": str(member.id),
+        "author_id": str(interaction.user.id),
+        "reason": sebep,
+        "date": tarih
+    }
+    veri_kaydet(data)
+
+    await interaction.response.send_message(f"{member.mention} kişisine başarıyla tutanak eklendi. (ID: {record_id})")
+    await send_log("📄 Tutanak Eklendi", interaction.user, member.id, sebep, discord.Color.orange())
+
+@tutanak_group.command(name="görüntüle", description="Personelin tutanaklarını görüntüler")
+@discord.app_commands.describe(member="Tutanakları gösterilecek personel")
+async def tutanak_goruntule(interaction: discord.Interaction, member: discord.Member = None):
+    target = member or interaction.user
+    data = veri_yukle()
+    
+    user_records = {rid: rdata for rid, rdata in data["records"].items() if rdata["user_id"] == str(target.id)}
+
+    if not user_records:
+        return await interaction.response.send_message(f"{target.mention} kişisine ait herhangi bir tutanak bulunamadı.", ephemeral=True)
+
+    embed = discord.Embed(title=f"{target.display_name} - Tutanak Kayıtları", color=discord.Color.dark_theme())
+    for rid, rdata in user_records.items():
+        embed.add_field(
+            name=f"Tutanak ID: {rid} | Tarih: {rdata['date']}",
+            value=f"**Tutanak Tutan:** <@{rdata['author_id']}>\n**Sebep:** {rdata['reason']}",
+            inline=False
+        )
+    await interaction.response.send_message(embed=embed)
+
+@tutanak_group.command(name="sil", description="ID'ye göre tutanak siler")
+@discord.app_commands.describe(record_id="Silinecek tutanağın ID numarası")
+async def tutanak_sil(interaction: discord.Interaction, record_id: int):
+    if not check_puan_yetki(interaction):
+        return await interaction.response.send_message("Tutanak silmek için yetkiniz yok.", ephemeral=True)
+
+    data = veri_yukle()
+    rid_str = str(record_id)
+
+    if rid_str not in data["records"]:
+        return await interaction.response.send_message("Belirtilen ID ile eşleşen bir tutanak bulunamadı.", ephemeral=True)
+
+    record = data["records"].pop(rid_str)
+    veri_kaydet(data)
+
+    await interaction.response.send_message(f"**{record_id}** ID'li tutanak başarıyla silindi.")
+    await send_log("🗑️ Tutanak Silindi", interaction.user, int(record["user_id"]), f"Silinen Tutanak ID: {record_id} (Eski Sebep: {record['reason']})", discord.Color.red())
+
+
+# ================================
+# /TOPLU GRUBU
+# ================================
+toplu_group = discord.app_commands.Group(name="toplu", description="Toplu işlemler")
+toplu_puan_group = discord.app_commands.Group(name="puan", description="Toplu puan işlemleri")
+
+@toplu_puan_group.command(name="sıfırla", description="Herkesin puanını sıfırlar")
+async def toplu_sifirla(interaction: discord.Interaction):
+    if not check_sifirla_yetki(interaction):
+        return await interaction.response.send_message("Bu komutu kullanmak için yetkiniz yok.", ephemeral=True)
+
+    data = veri_yukle()
+    data["users"] = {}
+    veri_kaydet(data)
+
+    await interaction.response.send_message("Sunucudaki herkesin puanı başarıyla sıfırlandı.")
+    await send_log("🔄 Toplu Puan Sıfırlama", interaction.user, None, "Tüm personelin puanları sıfırlandı.", discord.Color.purple())
+
+@toplu_puan_group.command(name="sorgu", description="Tüm personelin puan dökümünü çıkarır")
+async def toplu_sorgu(interaction: discord.Interaction):
+    await interaction.response.defer()
+    
+    data = veri_yukle()
+    users = data["users"]
+
+    if not users:
+        return await interaction.followup.send("Sistemde puanı bulunan kimse yok.")
+
+    sorted_users = sorted(users.items(), key=lambda x: x[1], reverse=True)
+
+    dokum = ""
+    for user_id_str, points in sorted_users:
+        if points <= 0:
+            continue
+        
+        user_id = int(user_id_str)
+        member = interaction.guild.get_member(user_id)
+        role_name = "Sivil / Rütbe Yok"
+
+        if member:
+            member_role_ids = [r.id for r in member.roles]
+            for r_id, r_name in RANKS.items():
+                if r_id in member_role_ids:
+                    role_name = r_name
+                    break
+        else:
+            role_name = "Ayrılmış Kullanıcı"
+
+        dokum += f"<@{user_id}> | **Rütbe:** {role_name} | **Puan:** {points}\n"
+
+    if not dokum:
+        return await interaction.followup.send("Sistemde 0'dan büyük puanı olan kimse yok.")
+
+    chunks = [dokum[i:i+1900] for i in range(0, len(dokum), 1900)]
+    for i, chunk in enumerate(chunks):
+        embed = discord.Embed(title=f"Toplu Personel Puan Dökümü ({i+1})", description=chunk, color=discord.Color.gold())
+        await interaction.followup.send(embed=embed)
+
+# --- Komut Gruplarını Ağaca (Tree) Ekleme ---
+bot.tree.add_command(puan_group)
+bot.tree.add_command(tutanak_group)
+
+toplu_group.add_command(toplu_puan_group)
+bot.tree.add_command(toplu_group)
+
+# --- Bot Çalıştırma ---
+TOKEN = os.environ.get("DISCORD_TOKEN")
+
+if TOKEN:
+    bot.run(TOKEN)
+else:
+    print("HATA: DISCORD_TOKEN ortam değişkeni bulunamadı! Lütfen Railway Variables kısmına ekleyin.")
