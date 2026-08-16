@@ -114,10 +114,15 @@ def check_sifirla_yetki(interaction: discord.Interaction):
     role_ids = [role.id for role in interaction.user.roles]
     return YETKILI_SIFIRLA in role_ids
 
+GUILD_ID = 1398636278001434634  # AAT | Tabur Komutanlığı sunucu ID'si
+
 @bot.event
 async def on_ready():
     try:
-        synced = await bot.tree.sync()
+        # Test sunucusuna özel sync -> komutlar anında görünür (global sync 1 saate kadar sürebilir)
+        guild = discord.Object(id=GUILD_ID)
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
         print(f"Slash komutları senkronize edildi: {len(synced)} komut.")
     except Exception as e:
         print(e)
