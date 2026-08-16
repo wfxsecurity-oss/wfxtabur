@@ -43,6 +43,39 @@ RANKS = {
     1529208057081364590: 'Askeri Kurultay'
 }
 
+# --- /sayım-yap için Rütbe Eşikleri ---
+# tenzil          -> bu puanın ALTI "Tenzil"
+# terfi_yok_ust    -> bu puana kadar "Terfi yok, Tenzil yok", üzerinde "1x Terfi" başlar
+# bir_x_terfi_ust  -> bu puana kadar "1x Terfi", bu puan ve üstü "2x Terfi"
+# two_tier=True olan roller sadece "Tenzil" / "Terfi yok, Tenzil yok" arasında gider.
+RANK_CONFIG = [
+    {"role_id": 1415343719300993045, "name": "OF6", "tenzil": 5, "terfi_yok_ust": 9, "bir_x_terfi_ust": 18},
+    {"role_id": 1415343720479461487, "name": "OF7", "tenzil": 5.5, "terfi_yok_ust": 10, "bir_x_terfi_ust": 20},
+    {"role_id": 1415343721402208346, "name": "OF8", "tenzil": 6, "terfi_yok_ust": 11, "bir_x_terfi_ust": 22},
+    # NOT: OF9 için Tenzil eşiği ayrıca belirtilmemişti, diğer rütbelerle tutarlı olacak
+    # şekilde 7 olarak varsayıldı.
+    {"role_id": 1415343721423175770, "name": "OF9", "tenzil": 7, "terfi_yok_ust": 12, "bir_x_terfi_ust": 24},
+    {"role_id": 1529208424016117830, "name": "Büyük Konsey", "tenzil": 8, "terfi_yok_ust": 12, "bir_x_terfi_ust": 24},
+    # NOT: "13>= 1x terfi" yazım hatası kabul edilip üst sınırla (14) tutarlı hale getirildi.
+    {"role_id": 1529208202477047959, "name": "Ankara Heyeti", "tenzil": 8, "terfi_yok_ust": 14, "bir_x_terfi_ust": 26},
+    {"role_id": 1529208215420539004, "name": "Ordu Komutanı", "tenzil": 8, "terfi_yok_ust": 14, "bir_x_terfi_ust": 28},
+    {"role_id": 1529208057081364590, "name": "Askeri Kurultay", "tenzil": 12, "two_tier": True},
+]
+
+def get_rank_status(role_id: int, points: float):
+    cfg = next((c for c in RANK_CONFIG if c["role_id"] == role_id), None)
+    if not cfg:
+        return None
+    if cfg.get("two_tier"):
+        return "Tenzil" if points < cfg["tenzil"] else "Terfi yok, Tenzil yok"
+    if points < cfg["tenzil"]:
+        return "Tenzil"
+    if points < cfg["terfi_yok_ust"]:
+        return "Terfi yok, Tenzil yok"
+    if points < cfg["bir_x_terfi_ust"]:
+        return "1x Terfi"
+    return "2x Terfi"
+
 # --- Bot Kurulumu (Intents) ---
 intents = discord.Intents.default()
 intents.message_content = True
@@ -76,8 +109,8 @@ def check_puan_yetki(interaction: discord.Interaction):
     return YETKILI_PUAN in role_ids
 
 def check_sifirla_yetki(interaction: discord.Interaction):
-    if interaction.user.guild_permissions.administrator: 
-        return True
+    # Kullanıcı isteği üzerine: SADECE YETKILI_SIFIRLA rolüne sahip olanlar kullanabilir.
+    # (Administrator baypası kaldırıldı.)
     role_ids = [role.id for role in interaction.user.roles]
     return YETKILI_SIFIRLA in role_ids
 
@@ -271,6 +304,98 @@ async def toplu_sorgu(interaction: discord.Interaction):
     for i, chunk in enumerate(chunks):
         embed = discord.Embed(title=f"Toplu Personel Puan Dökümü ({i+1})", description=chunk, color=discord.Color.gold())
         await interaction.followup.send(embed=embed)
+
+
+# ================================
+# /SAYIM-YAP KOMUTU
+# ================================
+class SayimView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, author_id: int):
+        super().__init__(timeout=180)
+        self.guild = guild
+        self.author_id = author_id
+        self.page = 0
+        self.total_pages = len(RANK_CONFIG)
+        self.message: discord.Message | None = None
+        self._update_button_states()
+
+    def _update_button_states(self):
+        self.prev_button.disabled = self.page == 0
+        self.next_button.disabled = self.page >= self.total_pages - 1
+
+    def build_embed(self) -> discord.Embed:
+        cfg = RANK_CONFIG[self.page]
+        role = self.guild.get_role(cfg["role_id"])
+        members = role.members if role else []
+
+        embed = discord.Embed(title=f"Sayım — {cfg['name']}", color=discord.Color.dark_theme())
+        embed.set_footer(text=f"Kategori {self.page + 1}/{self.total_pages} — {len(members)} üye")
+
+        if not members:
+            embed.description = "Bu rolde üye bulunamadı."
+            return embed
+
+        data = veri_yukle()
+        sorted_members = sorted(
+            members,
+            key=lambda m: data["users"].get(str(m.id), 0),
+            reverse=True,
+        )
+
+        lines = []
+        for m in sorted_members:
+            points = data["users"].get(str(m.id), 0)
+            status = get_rank_status(cfg["role_id"], points)
+            lines.append(f"{m.display_name} — **{points}P** — {status}")
+
+        desc = "\n".join(lines)
+        if len(desc) > 4000:
+            desc = desc[:4000] + "\n..."
+        embed.description = desc
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message(
+                "Bu butonları sadece komutu kullanan kişi kullanabilir.", ephemeral=True
+            )
+        self.page = max(0, self.page - 1)
+        self._update_button_states()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message(
+                "Bu butonları sadece komutu kullanan kişi kullanabilir.", ephemeral=True
+            )
+        self.page = min(self.total_pages - 1, self.page + 1)
+        self._update_button_states()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+@bot.tree.command(name="sayım-yap", description="Rütbe rollerine göre sayım yapar ve terfi/tenzil durumunu gösterir")
+async def sayim_yap(interaction: discord.Interaction):
+    await interaction.response.defer()
+    # Rol üyeliklerinin tam ve güncel olması için üyeleri chunk'la.
+    if interaction.guild.chunked is False:
+        await interaction.guild.chunk()
+
+    view = SayimView(interaction.guild, interaction.user.id)
+    embed = view.build_embed()
+    message = await interaction.followup.send(embed=embed, view=view)
+    view.message = message
+
 
 # --- Komut Gruplarını Ağaca (Tree) Ekleme ---
 bot.tree.add_command(puan_group)
